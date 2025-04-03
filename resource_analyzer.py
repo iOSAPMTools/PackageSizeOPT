@@ -14,6 +14,7 @@ import sys
 import hashlib
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm  # 添加进度条库
 
 # --- Dependencies Check ---
 try:
@@ -26,6 +27,12 @@ try:
     import imagehash
 except ImportError:
     print("错误：缺少 ImageHash 库。请运行 'pip install ImageHash' 或 'pip3 install ImageHash' 进行安装。")
+    sys.exit(1)
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("错误：缺少 tqdm 库。请运行 'pip install tqdm' 或 'pip3 install tqdm' 进行安装。")
     sys.exit(1)
 
 # --- Output Format Configuration ---
@@ -162,13 +169,37 @@ EXCLUDED_DIR_PATTERNS = {'.framework', '.bundle', '.app', '.xcworkspace', '.xcod
 # Looks for SwiftUI Image("ResourceName")
 # Now also looks for SwiftUI Image(systemName: "ResourceName")
 CODE_REFERENCE_REGEX = re.compile(
-    r'UIImage\(named:\s*["\']([\w\-]+)["\']\)|'          # Swift UIImage
-    r'NSImage\(named:\s*["\']([\w\-]+)["\']\)|'          # Swift NSImage
-    r'\[UIImage\s+imageNamed:\s*@?"([\w\-]+)"\]|'       # Obj-C UIImage
-    r'\[NSImage\s+imageNamed:\s*@?"([\w\-]+)"\]|'       # Obj-C NSImage
-    r'\b[Rr]\.(image|color|file|font)\.([\w\-]+)|'        # R.swift (or similar) - captures type and name
-    r'Image\(\s*["\']([\w\-]+)["\']\)|'                   # SwiftUI Image("...")
-    r'Image\(\s*systemName:\s*["\']([\w\-\.]+)["\']\)'    # SwiftUI Image(systemName: "...")
+    # UIKit/AppKit
+    r'UIImage\(named:\s*["\']([\w\-\.]+)["\']\)|'          # Swift UIImage
+    r'NSImage\(named:\s*["\']([\w\-\.]+)["\']\)|'          # Swift NSImage
+    r'\[UIImage\s+imageNamed:\s*@?"([\w\-\.]+)"\]|'       # Obj-C UIImage
+    r'\[NSImage\s+imageNamed:\s*@?"([\w\-\.]+)"\]|'       # Obj-C NSImage
+    r'UIImage\(contentsOfFile:\s*["\']([\w\-\.]+)["\']\)|'  # UIImage(contentsOfFile:)
+    r'NSImage\(contentsOfFile:\s*["\']([\w\-\.]+)["\']\)|'  # NSImage(contentsOfFile:)
+    
+    # SwiftUI
+    r'Image\(\s*["\']([\w\-\.]+)["\']\)|'                   # SwiftUI Image("...")
+    r'Image\(\s*systemName:\s*["\']([\w\-\.]+)["\']\)|'     # SwiftUI Image(systemName: "...")
+    r'Image\(\s*decorative:\s*["\']([\w\-\.]+)["\']\)|'      # SwiftUI Image(decorative: "...")
+    r'Label\([^,]+,\s*systemImage:\s*["\']([\w\-\.]+)["\']\)|'  # SwiftUI Label(_, systemImage: "...")
+    r'Bundle\.main\.url\(forResource:\s*["\']([\w\-\.]+)["\']\)|'  # Bundle.main.url(forResource:)
+    
+    # 资源管理库
+    r'\b[Rr]\.(image|color|file|font|string|asset)\.([\w\-\.]+)|'  # R.swift/SwiftGen
+    r'Asset\.([\w\-\.]+)\.image|'                           # SwiftGen Assets
+    r'L10n\.([\w\-\.]+)|'                                   # SwiftGen Localization
+    r'ColorName\.([\w\-\.]+)|'                              # SwiftGen Colors
+    r'FontFamily\.([\w\-\.]+)|'                             # SwiftGen Fonts
+    
+    # SF Symbols
+    r'UIImage\(systemName:\s*["\']([\w\-\.]+)["\']\)|'      # UIImage(systemName:)
+    r'NSImage\(symbolName:\s*["\']([\w\-\.]+)["\']\)|'       # NSImage(symbolName:)
+    r'Symbol\(["\']([\w\-\.]+)["\']\)|'                      # Symbol("...")
+    
+    # 其他常见模式
+    r'named:\s*["\']([\w\-\.]+)["\']\)|'                     # 通用named参数
+    r'forResource:\s*["\']([\w\-\.]+)["\']\)|'               # 通用forResource参数
+    r'NSLocalizedString\(["\']([\w\-\.]+)["\']'              # 本地化字符串
 )
 
 # 增加对常见动态字符串拼接模式的检测
@@ -1026,135 +1057,151 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
     possible_reference_files_count = 0
     search_extensions = CODE_FILE_EXTENSIONS | INTERFACE_FILE_EXTENSIONS | PLIST_FILE_EXTENSIONS | OTHER_SEARCH_EXTENSIONS
 
+    # 首先统计需要扫描的文件总数
+    total_files = 0
     for root, dirs, files in os.walk(project_dir, topdown=True):
-         # Modify dirs in-place to skip excluded directories
         dirs[:] = [d for d in dirs if not should_exclude(os.path.join(root, d), project_dir)]
-
         for filename in files:
             filepath = os.path.join(root, filename)
             if should_exclude(filepath, project_dir):
                 continue
-
             _, ext = os.path.splitext(filename)
-            ext_lower = ext.lower()
+            if ext.lower() in search_extensions:
+                total_files += 1
 
-            content = ""
-            try:
-                if ext_lower in CODE_FILE_EXTENSIONS or ext_lower in INTERFACE_FILE_EXTENSIONS or ext_lower in OTHER_SEARCH_EXTENSIONS:
-                    possible_reference_files_count += 1
-                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
+    # 使用进度条扫描文件
+    with tqdm(total=total_files, desc="扫描文件", unit="文件") as pbar:
+        for root, dirs, files in os.walk(project_dir, topdown=True):
+            # Modify dirs in-place to skip excluded directories
+            dirs[:] = [d for d in dirs if not should_exclude(os.path.join(root, d), project_dir)]
 
-                # Search in Code files
-                if ext_lower in CODE_FILE_EXTENSIONS:
-                    matches = CODE_REFERENCE_REGEX.finditer(content)
-                    for match in matches:
-                        # Extract the first non-None group
-                        ref = next((g for g in match.groups() if g is not None), None)
-                        if match.group(6) and match.group(7): # Handle R.swift style (Group 6=type, Group 7=name)
-                            ref = match.group(7)
-                        if ref:
-                            # 增加更严格的过滤条件
-                            if (1 < len(ref) < 100 and 
-                                not ('/' in ref or '\\' in ref) and
-                                not ref.startswith(('http', 'www')) and  # 排除 URL
-                                not ref.isdigit() and  # 排除纯数字
-                                not ref.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and  # 排除系统前缀
-                                not ref in {'hide', 'show', 'success', 'error', 'warning'}):  # 排除常见非资源词
-                                referenced_identifiers.add(ref.split('.')[0])
-                    
-                    # 检测动态拼接模式
-                    dynamic_matches = DYNAMIC_PATTERN_REGEX.finditer(content)
-                    for match in dynamic_matches:
-                        # 提取所有潜在的静态部分
-                        static_parts = [g for g in match.groups() if g is not None]
-                        for part in static_parts:
-                            if (1 < len(part) < 100 and 
-                                not ('/' in part or '\\' in part) and
-                                not part.startswith(('http', 'www')) and
-                                not part.isdigit() and
-                                not part.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
-                                not part in {'hide', 'show', 'success', 'error', 'warning'}):
-                                referenced_identifiers.add(part.split('.')[0])
-                                
-                                # 由于这是动态拼接，增加额外处理
-                                # 如果静态部分是前缀或后缀，尝试查找可能的完整资源名
-                                for res_id in resources.keys():
-                                    if res_id.startswith(part) or res_id.endswith(part):
-                                        referenced_identifiers.add(res_id)
+            for filename in files:
+                filepath = os.path.join(root, filename)
+                if should_exclude(filepath, project_dir):
+                    continue
 
-                # Search in Storyboards/XIBs (XML)
-                elif ext_lower in INTERFACE_FILE_EXTENSIONS:
-                    matches = XML_REFERENCE_REGEX.finditer(content)
-                    for match in matches:
-                        # 提取所有非空的组
-                        potential_refs = [g for g in match.groups() if g is not None]
-                        for ref in potential_refs:
-                            if (1 < len(ref) < 100 and 
-                                  not ('/' in ref or '\\' in ref) and
-                                  not ref.startswith(('http', 'www')) and
-                                  not ref.isdigit() and
-                                  not ref.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
-                                  not ref in {'hide', 'show', 'success', 'error', 'warning'}):
-                                
-                                # 处理带扩展名的资源引用
-                                if '.' in ref:
-                                    base_ref = ref.split('.')[0]
-                                    referenced_identifiers.add(base_ref)
-                                    referenced_identifiers.add(ref)  # 同时添加完整引用
-                                else:
-                                    referenced_identifiers.add(ref)
+                _, ext = os.path.splitext(filename)
+                ext_lower = ext.lower()
+
+                content = ""
+                try:
+                    if ext_lower in CODE_FILE_EXTENSIONS or ext_lower in INTERFACE_FILE_EXTENSIONS or ext_lower in OTHER_SEARCH_EXTENSIONS:
+                        possible_reference_files_count += 1
+                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+
+                    # Search in Code files
+                    if ext_lower in CODE_FILE_EXTENSIONS:
+                        matches = CODE_REFERENCE_REGEX.finditer(content)
+                        for match in matches:
+                            # Extract the first non-None group
+                            ref = next((g for g in match.groups() if g is not None), None)
+                            if match.group(6) and match.group(7): # Handle R.swift style (Group 6=type, Group 7=name)
+                                ref = match.group(7)
+                            if ref:
+                                # 增加更严格的过滤条件
+                                if (1 < len(ref) < 100 and 
+                                    not ('/' in ref or '\\' in ref) and
+                                    not ref.startswith(('http', 'www')) and  # 排除 URL
+                                    not ref.isdigit() and  # 排除纯数字
+                                    not ref.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and  # 排除系统前缀
+                                    not ref in {'hide', 'show', 'success', 'error', 'warning'}):  # 排除常见非资源词
+                                    referenced_identifiers.add(ref.split('.')[0])
+                        
+                        # 检测动态拼接模式
+                        dynamic_matches = DYNAMIC_PATTERN_REGEX.finditer(content)
+                        for match in dynamic_matches:
+                            # 提取所有潜在的静态部分
+                            static_parts = [g for g in match.groups() if g is not None]
+                            for part in static_parts:
+                                if (1 < len(part) < 100 and 
+                                    not ('/' in part or '\\' in part) and
+                                    not part.startswith(('http', 'www')) and
+                                    not part.isdigit() and
+                                    not part.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
+                                    not part in {'hide', 'show', 'success', 'error', 'warning'}):
+                                    referenced_identifiers.add(part.split('.')[0])
                                     
-                                    # 尝试查找可能匹配的资源
+                                    # 由于这是动态拼接，增加额外处理
+                                    # 如果静态部分是前缀或后缀，尝试查找可能的完整资源名
                                     for res_id in resources.keys():
-                                        if res_id.startswith(ref + '.') or res_id == ref:
+                                        if res_id.startswith(part) or res_id.endswith(part):
                                             referenced_identifiers.add(res_id)
 
-                # Search in Plist files
-                elif ext_lower in PLIST_FILE_EXTENSIONS:
-                    plist_strings = extract_plist_strings(filepath)
-                    # 过滤 plist 字符串
-                    filtered_strings = {
-                        s for s in plist_strings 
-                        if (1 < len(s) < 100 and 
-                            not ('/' in s or '\\' in s) and
-                            not s.startswith(('http', 'www')) and
-                            not s.isdigit() and
-                            not s.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
-                            not s in {'hide', 'show', 'success', 'error', 'warning'})
-                    }
-                    referenced_identifiers.update(filtered_strings)
+                    # Search in Storyboards/XIBs (XML)
+                    elif ext_lower in INTERFACE_FILE_EXTENSIONS:
+                        matches = XML_REFERENCE_REGEX.finditer(content)
+                        for match in matches:
+                            # 提取所有非空的组
+                            potential_refs = [g for g in match.groups() if g is not None]
+                            for ref in potential_refs:
+                                if (1 < len(ref) < 100 and 
+                                      not ('/' in ref or '\\' in ref) and
+                                      not ref.startswith(('http', 'www')) and
+                                      not ref.isdigit() and
+                                      not ref.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
+                                      not ref in {'hide', 'show', 'success', 'error', 'warning'}):
+                                    
+                                    # 处理带扩展名的资源引用
+                                    if '.' in ref:
+                                        base_ref = ref.split('.')[0]
+                                        referenced_identifiers.add(base_ref)
+                                        referenced_identifiers.add(ref)  # 同时添加完整引用
+                                    else:
+                                        referenced_identifiers.add(ref)
+                                        
+                                        # 尝试查找可能匹配的资源
+                                        for res_id in resources.keys():
+                                            if res_id.startswith(ref + '.') or res_id == ref:
+                                                referenced_identifiers.add(res_id)
 
-                # Search in other text-based files (.strings, .json)
-                elif ext_lower in OTHER_SEARCH_EXTENSIONS:
-                    # 使用专门的函数处理其他类型文件
-                    other_refs = scan_other_references(filepath, project_dir)
-                    if other_refs:
-                        referenced_identifiers.update(other_refs)
-                        
-                    # 同时保留旧的代码，以防漏检
-                    known_identifiers = set(resources.keys())
-                    for identifier in known_identifiers:
-                        try:
-                            if re.search(r'\b' + re.escape(identifier) + r'\b', content) or \
-                               re.search(r'"' + re.escape(identifier) + r'"', content) or \
-                               re.search(r"'" + re.escape(identifier) + r"'", content):
-                                referenced_identifiers.add(identifier)
-                                base_identifier = Path(identifier).stem
-                                if base_identifier != identifier:
-                                    referenced_identifiers.add(base_identifier)
-                        except re.error:
-                            if identifier in content:
-                                referenced_identifiers.add(identifier)
-                                base_identifier = Path(identifier).stem
-                                if base_identifier != identifier:
-                                    referenced_identifiers.add(base_identifier)
+                    # Search in Plist files
+                    elif ext_lower in PLIST_FILE_EXTENSIONS:
+                        plist_strings = extract_plist_strings(filepath)
+                        # 过滤 plist 字符串
+                        filtered_strings = {
+                            s for s in plist_strings 
+                            if (1 < len(s) < 100 and 
+                                not ('/' in s or '\\' in s) and
+                                not s.startswith(('http', 'www')) and
+                                not s.isdigit() and
+                                not s.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
+                                not s in {'hide', 'show', 'success', 'error', 'warning'})
+                        }
+                        referenced_identifiers.update(filtered_strings)
 
+                    # Search in other text-based files (.strings, .json)
+                    elif ext_lower in OTHER_SEARCH_EXTENSIONS:
+                        # 使用专门的函数处理其他类型文件
+                        other_refs = scan_other_references(filepath, project_dir)
+                        if other_refs:
+                            referenced_identifiers.update(other_refs)
+                            
+                        # 同时保留旧的代码，以防漏检
+                        known_identifiers = set(resources.keys())
+                        for identifier in known_identifiers:
+                            try:
+                                if re.search(r'\b' + re.escape(identifier) + r'\b', content) or \
+                                   re.search(r'"' + re.escape(identifier) + r'"', content) or \
+                                   re.search(r"'" + re.escape(identifier) + r"'", content):
+                                    referenced_identifiers.add(identifier)
+                                    base_identifier = Path(identifier).stem
+                                    if base_identifier != identifier:
+                                        referenced_identifiers.add(base_identifier)
+                            except re.error:
+                                if identifier in content:
+                                    referenced_identifiers.add(identifier)
+                                    base_identifier = Path(identifier).stem
+                                    if base_identifier != identifier:
+                                        referenced_identifiers.add(base_identifier)
 
-            except Exception as e:
-                # print(f"Warning: Could not read or process {filepath}: {e}")
-                print(f"警告：无法读取或处理文件 {filepath}：{e}")
-
+                except Exception as e:
+                    # print(f"Warning: Could not read or process {filepath}: {e}")
+                    print(f"警告：无法读取或处理文件 {filepath}：{e}")
+                
+                # 更新进度条
+                if ext_lower in search_extensions:
+                    pbar.update(1)
 
     print(f"已扫描 {possible_reference_files_count} 个可能的代码/界面/配置/其他文件以查找引用。")
     print(f"总共找到 {len(referenced_identifiers)} 个唯一的潜在引用字符串 (包含项目设置)。")
@@ -1280,12 +1327,6 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
     # 添加特定建议
     optimization_suggestions.extend(specific_suggestions)
     
-    # 输出优化建议
-    print("\n--- 资源优化建议 ---")
-    for suggestion in optimization_suggestions:
-        print(f"\n{suggestion['type']}:")
-        print(suggestion['suggestion'])
-
     # --- Pass 4: Output Similar Images ---
     print("\n--- 相似图片组 (基于感知哈希) ---")
     if not similar_image_groups:
@@ -1321,8 +1362,6 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
         print(f"所有相似组总计潜在可节省空间: {total_potential_savings / (1024.0*1024.0):.2f} MB")
         print("注意：此相似性检测已过滤掉同一资源集内部的图片（如 @2x/@3x 变体）。") # Added note
         print("注意：请务必手动确认这些图片是否真的可以合并或移除。")
-
-    print("\n分析完成。")
 
     # --- Prepare Output Data ---
     output_data = {
@@ -1528,30 +1567,14 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print(f"\nHTML 报告已生成：{os.path.abspath(output_file)}")
-    else:  # Default text output
-        print("\n--- 资源大小 (已排序) ---")
-        sorted_resources = sorted(resources.items(), key=lambda item: item[1]['size'], reverse=True)
-        if not sorted_resources:
-            print("未找到资源文件。")
-        else:
-            print(f"{'大小 (KB)':>12} | {'类型':<6} | 标识符 (路径)")
-            print("-" * 100)
-            total_size_kb = 0
-            for identifier, data in sorted_resources:
-                size_kb = data['size'] / 1024.0
-                total_size_kb += size_kb
-                line = f"{size_kb:12.2f} | {data['type']:<6} | {identifier} ({data['path']})"
-                if size_kb >= large_threshold_kb:
-                    print(f"{COLOR_RED}{line}{COLOR_RESET}")
-                else:
-                    print(line)
-            print("-" * 100)
-            print(f"总资源大小：{total_size_kb / 1024.0:.2f} MB")
 
-        print("\n--- 资源优化建议 ---")
-        for suggestion in optimization_suggestions:
-            print(f"\n{suggestion['type']}:")
-            print(suggestion['suggestion'])
+    # --- 输出资源优化建议 ---
+    print("\n--- 资源优化建议 ---")
+    for suggestion in optimization_suggestions:
+        print(f"\n{suggestion['type']}:")
+        print(suggestion['suggestion'])
+
+    print("\n分析完成。")
 
     return output_data
 
