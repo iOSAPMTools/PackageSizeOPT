@@ -121,8 +121,15 @@ RESOURCE_EXTENSIONS = {
     '.arresourcegroup',                             # AR Resource Groups
     '.arworldmap',                                  # AR World Maps
     '.arcoachingoverlay',                           # AR Coaching Overlays
-    '.arcoachingdata'                               # AR Coaching Data
+    '.arcoachingdata',                              # AR Coaching Data
+    '.car'                                          # 已编译的资源文件
 }
+
+# 超大图片尺寸阈值（像素）
+LARGE_IMAGE_WIDTH_THRESHOLD = 2000
+LARGE_IMAGE_HEIGHT_THRESHOLD = 2000
+# 超大图片尺寸与权重比阈值（KB/千像素）- 用于检测过度大小的图片
+LARGE_IMAGE_SIZE_RATIO_THRESHOLD = 10.0  # KB/千像素
 
 # Asset Catalog Types (extended)
 ASSET_TYPES = (
@@ -153,20 +160,38 @@ EXCLUDED_DIR_PATTERNS = {'.framework', '.bundle', '.app', '.xcworkspace', '.xcod
 # Looks for [UIImage imageNamed:@"ResourceName"], [NSImage imageNamed:@"ResourceName"]
 # Looks for R.image.resourceName, R.string.resourceName etc. (R.swift) - adjust 'R' if needed
 # Looks for SwiftUI Image("ResourceName")
-# This is basic and may need refinement for specific project conventions
+# Now also looks for SwiftUI Image(systemName: "ResourceName")
 CODE_REFERENCE_REGEX = re.compile(
     r'UIImage\(named:\s*["\']([\w\-]+)["\']\)|'          # Swift UIImage
     r'NSImage\(named:\s*["\']([\w\-]+)["\']\)|'          # Swift NSImage
     r'\[UIImage\s+imageNamed:\s*@?"([\w\-]+)"\]|'       # Obj-C UIImage
     r'\[NSImage\s+imageNamed:\s*@?"([\w\-]+)"\]|'       # Obj-C NSImage
     r'\b[Rr]\.(image|color|file|font)\.([\w\-]+)|'        # R.swift (or similar) - captures type and name
-    r'Image\(\s*["\']([\w\-]+)["\']\)'                   # SwiftUI Image("...")
+    r'Image\(\s*["\']([\w\-]+)["\']\)|'                   # SwiftUI Image("...")
+    r'Image\(\s*systemName:\s*["\']([\w\-\.]+)["\']\)'    # SwiftUI Image(systemName: "...")
+)
+
+# 增加对常见动态字符串拼接模式的检测
+DYNAMIC_PATTERN_REGEX = re.compile(
+    r'(UIImage|NSImage)\(named:\s*\w+\s*\+\s*["\']([\w\-]+)["\']|'  # 变量 + "后缀" (Swift)
+    r'(UIImage|NSImage)\(named:\s*["\']([\w\-]+)["\']\s*\+\s*\w+|'  # "前缀" + 变量 (Swift)
+    r'imageNamed:\s*\[(\w+)\s+stringByAppendingString:\s*@"([\w\-]+)"\]|'  # [var stringByAppendingString:@"后缀"] (Obj-C)
+    r'imageNamed:\s*\[@"([\w\-]+)"\s+stringByAppendingString:\s*\w+\]|'    # [@"前缀" stringByAppendingString:var] (Obj-C)
+    r'NSString\s*\*\s*\w+\s*=\s*\[NSString\s+stringWithFormat:\s*@["\'][\w\-%@]+["\']\s*,\s*(\w+)\]|'  # 字符串格式化 (Obj-C)
+    r'let\s+\w+\s*=\s*["\'][\w\-]+["\']\s*\+\s*\w+\s*\+\s*["\']([\w\-]+)["\']|'  # 多段拼接 (Swift)
+    r'String\(format:\s*["\']([\w\-%s]+)["\']\s*,\s*\w+\)'  # 字符串格式化 (Swift)
 )
 
 # Regex to find potential resource references in XML-based files (Storyboards, XIBs)
 # Looks for image="ResourceName", key="ResourceName" (often in user defined attributes), etc.
 XML_REFERENCE_REGEX = re.compile(
-    r'(?:image|name|key|resourceName)\s*=\s*["\']([\w\-]+)["\']'
+    r'(?:image|name|key|resourceName)\s*=\s*["\']([\w\-]+)["\']|'         # 常规属性
+    r'<imageView.*?image\s*=\s*["\']([\w\-]+)["\']|'                     # 图片视图
+    r'customClass\s*=\s*["\']([\w\-]+)["\']|'                            # 自定义类名
+    r'storyboardIdentifier\s*=\s*["\']([\w\-]+)["\']|'                   # 故事板标识符
+    r'<resources>.*?<\s*image\s+name\s*=\s*["\']([\w\-]+)["\'].*?</resources>|'  # 资源部分
+    r'value\s*=\s*["\']([\w\-]+\.png)["\']|'                             # 直接包含扩展名的资源
+    r'filename\s*=\s*["\']([\w\-]+)["\']'                                # 文件名属性
 )
 
 # --- Image Similarity Configuration ---
@@ -186,6 +211,105 @@ def get_file_size(path):
         return os.path.getsize(path)
     except OSError:
         return 0
+
+def is_lproj_directory(path):
+    """检查是否为本地化资源目录(.lproj)"""
+    return os.path.isdir(path) and path.endswith('.lproj')
+
+def analyze_lproj_directory(lproj_path, project_root):
+    """分析本地化资源目录(.lproj)的内容"""
+    locale = os.path.basename(lproj_path).split('.')[0]
+    resources = {}
+    total_size = 0
+    
+    try:
+        for item in os.listdir(lproj_path):
+            item_path = os.path.join(lproj_path, item)
+            if os.path.isfile(item_path):
+                rel_path = os.path.relpath(item_path, project_root)
+                file_size = get_file_size(item_path)
+                total_size += file_size
+                
+                # 创建本地化资源标识符
+                base_name = os.path.splitext(item)[0]
+                identifier = f"{base_name}_{locale}"  # 例如：Localizable_en
+                
+                # 处理 .strings 文件内部的字符串引用
+                if item.endswith('.strings'):
+                    strings_refs = extract_strings_file_references(item_path)
+                    if strings_refs:
+                        resources[identifier] = {
+                            'path': rel_path,
+                            'size': file_size,
+                            'type': 'localization',
+                            'locale': locale,
+                            'string_keys': strings_refs
+                        }
+                    else:
+                        resources[identifier] = {
+                            'path': rel_path,
+                            'size': file_size,
+                            'type': 'localization',
+                            'locale': locale
+                        }
+                else:
+                    resources[identifier] = {
+                        'path': rel_path,
+                        'size': file_size,
+                        'type': 'localization',
+                        'locale': locale
+                    }
+    except OSError as e:
+        print(f"警告：无法访问本地化目录 '{lproj_path}'：{e}")
+    
+    return resources, total_size
+
+def extract_strings_file_references(strings_file_path):
+    """从 .strings 文件中提取键和值"""
+    references = set()
+    try:
+        with open(strings_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+        # 匹配 "Key" = "Value"; 格式的字符串
+        matches = re.finditer(r'"([^"]+)"\s*=\s*"([^"]+)"\s*;', content)
+        for match in matches:
+            key = match.group(1)
+            # value = match.group(2)  # 如果需要可以存储值
+            references.add(key)
+            
+    except Exception as e:
+        print(f"警告：无法解析 .strings 文件 '{strings_file_path}'：{e}")
+    
+    return references
+
+def analyze_car_file(car_path):
+    """分析已编译的资源文件(.car)，提取基本信息。
+    
+    注意：完整解析 CAR 文件需要特殊工具，此函数仅提供基本信息。
+    """
+    result = {
+        'size': get_file_size(car_path),
+        'type': 'compiled_asset',
+        'identifier': os.path.basename(car_path),
+    }
+    
+    # 尝试使用 assetutil 工具获取更多信息（仅在 macOS 上可用）
+    try:
+        import subprocess
+        output = subprocess.check_output(['assetutil', car_path], stderr=subprocess.STDOUT, universal_newlines=True)
+        # 简单解析输出
+        if output:
+            result['has_asset_info'] = True
+            # 尝试提取资源名称
+            name_match = re.search(r'Name:\s+([^\n]+)', output)
+            if name_match:
+                result['asset_name'] = name_match.group(1).strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        # assetutil 不可用或执行失败
+        result['has_asset_info'] = False
+    
+    return result
 
 def get_dir_size(path):
     """Gets the total size of all files within a directory (recursively)."""
@@ -218,6 +342,16 @@ def should_exclude(path_str, project_root):
     return False
 
 
+# 常见配置键，可能指向资源文件
+CONFIG_RESOURCE_KEYS = {
+    'CFBundleIconFile', 'CFBundleIconFiles', 'UILaunchImageFile', 
+    'UIPrerenderedIcon', 'UIApplicationShortcutItemIconFile',
+    'NSPhotoLibraryUsageDescription', 'NSCameraUsageDescription',
+    'UIBackgroundModes', 'UIRequiredDeviceCapabilities',
+    'UISupportedInterfaceOrientations', 'icon', 'artwork', 'background',
+    'logo', 'bundle', 'resource', 'image', 'sound', 'media'
+}
+
 def extract_plist_strings(filepath):
     """Extracts all string values from a plist file."""
     strings = set()
@@ -225,7 +359,7 @@ def extract_plist_strings(filepath):
         with open(filepath, 'rb') as fp:
             plist_data = plistlib.load(fp)
 
-        def find_strings(data):
+        def find_strings(data, parent_key=None):
             if isinstance(data, str):
                 # Basic check to avoid adding overly long strings or potential paths
                 if 1 < len(data) < 100 and not ('/' in data or '\\' in data):
@@ -233,13 +367,16 @@ def extract_plist_strings(filepath):
                      base_name = data.split('.')[0]
                      if base_name:
                          strings.add(base_name)
+                         if parent_key in CONFIG_RESOURCE_KEYS:
+                             # 如果父键是已知的资源配置键，也添加完整值
+                             strings.add(data)
             elif isinstance(data, dict):
                 for key, value in data.items():
                     if isinstance(key, str) and 1 < len(key) < 100: # Add keys too, they might be resource names
                          base_key = key.split('.')[0]
                          if base_key:
                             strings.add(base_key)
-                    find_strings(value)
+                    find_strings(value, key)
             elif isinstance(data, list):
                 for item in data:
                     find_strings(item)
@@ -250,6 +387,87 @@ def extract_plist_strings(filepath):
         # print(f"Warning: Could not parse plist {filepath}: {e}")
         pass
     return strings
+
+def scan_other_references(filepath, root_dir):
+    """扫描其他类型文件中的资源引用，如 JSON 配置文件"""
+    references = set()
+    try:
+        _, ext = os.path.splitext(filepath)
+        ext_lower = ext.lower()
+        
+        # 处理 JSON 文件
+        if ext_lower == '.json':
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                try:
+                    json_data = json.load(f)
+                    
+                    def extract_json_refs(data, parent_key=None):
+                        if isinstance(data, str):
+                            # 处理字符串值
+                            if 1 < len(data) < 100 and not ('/' in data or '\\' in data):
+                                if not data.startswith(('http', 'www')):
+                                    base_name = data.split('.')[0]
+                                    if base_name:
+                                        references.add(base_name)
+                                        if parent_key in CONFIG_RESOURCE_KEYS:
+                                            references.add(data)
+                        elif isinstance(data, dict):
+                            # 处理字典
+                            for key, value in data.items():
+                                if isinstance(key, str) and key.lower() in {'image', 'icon', 'resource', 'file'}:
+                                    # 特殊处理可能是资源引用的键
+                                    if isinstance(value, str) and 1 < len(value) < 100:
+                                        references.add(value)
+                                        base_name = value.split('.')[0]
+                                        if base_name != value:
+                                            references.add(base_name)
+                                extract_json_refs(value, key)
+                        elif isinstance(data, list):
+                            # 处理列表
+                            for item in data:
+                                extract_json_refs(item)
+                    
+                    extract_json_refs(json_data)
+                except json.JSONDecodeError:
+                    # 解析失败，尝试简单文本模式
+                    f.seek(0)
+                    content = f.read()
+                    for line in content.splitlines():
+                        if '"' in line or "'" in line:
+                            # 简单提取引号内的内容
+                            matches = re.findall(r'["\']([\w\-\.]+)["\']', line)
+                            for match in matches:
+                                if 1 < len(match) < 100 and not ('/' in match or '\\' in match):
+                                    references.add(match)
+                                    if '.' in match:
+                                        references.add(match.split('.')[0])
+        
+        # 处理其他文本文件
+        else:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                
+                # 查找可能的图片/资源名称模式
+                patterns = [
+                    r'["\']([\w\-]+\.(png|jpg|jpeg|gif))["\']',  # 带扩展名的完整文件名
+                    r'["\']([\w\-]+)["\']'  # 通用字符串，可能是资源名
+                ]
+                
+                for pattern in patterns:
+                    matches = re.finditer(pattern, content)
+                    for match in matches:
+                        value = match.group(1)
+                        if 1 < len(value) < 100 and not ('/' in value or '\\' in value):
+                            references.add(value)
+                            if '.' in value:
+                                base_name = value.split('.')[0]
+                                if base_name:
+                                    references.add(base_name)
+    
+    except Exception as e:
+        print(f"警告：分析文件 {filepath} 时出错：{e}")
+    
+    return references
 
 def find_xcodeproj_path(start_dir):
     """Finds the .xcodeproj directory near the start_dir."""
@@ -323,14 +541,19 @@ def calculate_image_hash(filepath):
         # Convert to L (grayscale) or RGB if needed, phash often works well with grayscale
         # img = img.convert('L')
         file_size = get_file_size(filepath)
+        
+        # 获取图片尺寸信息
+        width, height = img.size
+        dimensions = {'width': width, 'height': height}
+        
         img_hash = HASH_ALGORITHM(img, hash_size=HASH_SIZE)
-        return img_hash, file_size
+        return img_hash, file_size, dimensions
     except FileNotFoundError:
         # print(f"警告：计算哈希时文件未找到：{filepath}")
-        return None, 0
+        return None, 0, None
     except Exception as e:
         # print(f"警告：无法计算图片 '{os.path.basename(filepath)}' 的哈希值：{e}")
-        return None, 0 # Return 0 size as well if hash fails
+        return None, 0, None  # Return 0 size as well if hash fails
 
 def extract_asset_catalog_references(asset_path):
     """从 .xcassets 的 Contents.json 中提取资源引用"""
@@ -418,17 +641,25 @@ class ResourceCache:
         """获取图片的哈希值（从缓存或重新计算）"""
         file_hash = self._get_file_hash(filepath)
         if not file_hash:
-            return None, 0
+            return None, 0, None
 
         cache_key = f"image_hash_{file_hash}"
         if cache_key in self.cache:
-            return self.cache[cache_key]
+            # 确保缓存中的数据也是三元组格式 (hash, size, dimensions)
+            cached_data = self.cache[cache_key]
+            if len(cached_data) == 2:  # 兼容旧缓存格式
+                img_hash, file_size = cached_data
+                dimensions = None
+                # 更新缓存到新格式
+                self.cache[cache_key] = (img_hash, file_size, dimensions)
+                return img_hash, file_size, dimensions
+            return cached_data  # 返回三元组
 
-        img_hash, file_size = calculate_image_hash(filepath)
+        img_hash, file_size, dimensions = calculate_image_hash(filepath)
         if img_hash is not None:
-            self.cache[cache_key] = (img_hash, file_size)
+            self.cache[cache_key] = (img_hash, file_size, dimensions)
             self._save_cache()
-        return img_hash, file_size
+        return img_hash, file_size, dimensions
 
     def get_file_references(self, filepath):
         """获取文件的资源引用（从缓存或重新扫描）"""
@@ -472,16 +703,31 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
     resources = {}  # {identifier: {'path': path, 'size': size, 'type': 'file'/'asset'}}
     referenced_identifiers = set()
     image_details = {} # {filepath: {'hash': hash_value, 'size': file_size}} - For similarity check
-
+    
     # --- Pass 1: Find all resources, calculate sizes, AND calculate image hashes ---
     print("正在扫描资源文件并计算图片哈希...")
     asset_set_count = 0
     regular_file_count = 0
     hashed_image_count = 0
+    lproj_count = 0  # 本地化目录计数
 
     for root, dirs, files in os.walk(project_dir, topdown=True):
         original_dirs = list(dirs)
         dirs[:] = [d for d in dirs if not should_exclude(os.path.join(root, d), project_dir)]
+
+        # --- 处理本地化目录 (.lproj) ---
+        lproj_dirs = [d for d in dirs if is_lproj_directory(os.path.join(root, d))]
+        for lproj_dir in lproj_dirs:
+            lproj_path = os.path.join(root, lproj_dir)
+            lproj_resources, lproj_size = analyze_lproj_directory(lproj_path, project_dir)
+            
+            # 合并本地化资源到主资源列表
+            if lproj_resources:
+                resources.update(lproj_resources)
+                lproj_count += 1
+                
+        # 从处理列表中排除已处理的本地化目录
+        dirs[:] = [d for d in dirs if not is_lproj_directory(os.path.join(root, d))]
 
         # --- Asset Set Handling (includes hashing images inside) ---
         processed_asset_dirs = []
@@ -508,10 +754,10 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
                             _, item_ext = os.path.splitext(item)
                             if item_ext.lower() in IMAGE_EXTENSIONS:
                                 if item_path not in image_details: # Avoid double hashing if already processed
-                                    img_hash, file_size = cache.get_image_hash(item_path)
+                                    img_hash, file_size, dimensions = cache.get_image_hash(item_path)
                                     if img_hash is not None:
                                         rel_item_path = os.path.relpath(item_path, project_dir)
-                                        image_details[rel_item_path] = {'hash': img_hash, 'size': file_size}
+                                        image_details[rel_item_path] = {'hash': img_hash, 'size': file_size, 'dimensions': dimensions}
                                         hashed_image_count += 1
                 except OSError as e:
                     print(f"警告：无法访问资源集合内部 '{dir_name}'：{e}")
@@ -543,9 +789,9 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
             if ext_lower in IMAGE_EXTENSIONS:
                 # Calculate hash first
                 if rel_filepath not in image_details: # Avoid double hashing
-                    img_hash, file_size = cache.get_image_hash(filepath)
+                    img_hash, file_size, dimensions = cache.get_image_hash(filepath)
                     if img_hash is not None:
-                        image_details[rel_filepath] = {'hash': img_hash, 'size': file_size}
+                        image_details[rel_filepath] = {'hash': img_hash, 'size': file_size, 'dimensions': dimensions}
                         hashed_image_count += 1
                     else:
                          file_size = get_file_size(filepath) # Still get size if hash failed
@@ -562,16 +808,20 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
 
                 if chosen_id not in resources:
                     resources[chosen_id] = {'path': rel_filepath, 'size': file_size, 'type': 'file'}
+                    
                     regular_file_count += 1
                 elif chosen_id == base_name and resources[chosen_id]['type'] == 'file':
                     if file_size > resources[chosen_id]['size']:
                         resources[chosen_id]['path'] = rel_filepath
                         resources[chosen_id]['size'] = file_size
+                    
                     if identifier != chosen_id and identifier not in resources:
                         resources[identifier] = {'path': rel_filepath, 'size': file_size, 'type': 'file'}
+                        
                         regular_file_count += 1
                 elif chosen_id == identifier and identifier not in resources:
                     resources[identifier] = {'path': rel_filepath, 'size': file_size, 'type': 'file'}
+                    
                     regular_file_count += 1
 
             # --- Process Other Resource Files (No Hashing) ---
@@ -580,6 +830,14 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
                  identifier = filename
                  base_name = Path(filename).stem
                  chosen_id = identifier if ext_lower == '.strings' else base_name
+
+                 # 特殊处理 .car 文件
+                 if ext_lower == '.car':
+                     car_info = analyze_car_file(filepath)
+                     if car_info.get('asset_name'):
+                         chosen_id = car_info['asset_name']
+                     identifier = car_info['identifier']
+                     file_size = car_info['size']
 
                  if chosen_id in resources and resources[chosen_id]['type'] == 'asset':
                      chosen_id = identifier
@@ -601,6 +859,7 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
 
     print(f"找到 {len(resources)} 个资源标识符 ({asset_set_count} 个资源集合已处理, {regular_file_count} 个独立资源文件已找到)。")
     print(f"已为 {hashed_image_count} 个图片文件计算哈希值。")
+    print(f"处理了 {lproj_count} 个本地化资源目录(.lproj)。")
 
     # --- Pass 1.5: Find Similar Images ---
     print("\n正在比较图片相似度...")
@@ -662,6 +921,46 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
     # Update the print message to reflect the used threshold
     print(f"找到 {len(similar_image_groups)} 组跨资源相似图片 (阈值 <= {similarity_threshold})。")
 
+    # --- 检测超大尺寸图片 ---
+    print("\n正在检测超大尺寸图片...")
+    oversized_images = []
+    
+    for img_path, details in image_details.items():
+        if 'dimensions' in details and details['dimensions']:
+            width = details['dimensions']['width']
+            height = details['dimensions']['height']
+            img_size_kb = details['size'] / 1024.0
+            
+            # 计算每千像素的KB大小 (用于判断图片是否过于"沉重")
+            pixels = (width * height) / 1000.0  # 千像素
+            kb_per_kpixel = img_size_kb / pixels if pixels > 0 else 0
+            
+            is_oversized = False
+            reason = []
+            
+            # 检查过大尺寸
+            if width > LARGE_IMAGE_WIDTH_THRESHOLD or height > LARGE_IMAGE_HEIGHT_THRESHOLD:
+                is_oversized = True
+                reason.append(f"尺寸过大 ({width}x{height}px)")
+            
+            # 检查过高的大小/像素比
+            if kb_per_kpixel > LARGE_IMAGE_SIZE_RATIO_THRESHOLD:
+                is_oversized = True
+                reason.append(f"压缩率低 ({kb_per_kpixel:.2f} KB/千像素)")
+            
+            if is_oversized:
+                oversized_images.append({
+                    'path': img_path,
+                    'size_kb': img_size_kb,
+                    'width': width,
+                    'height': height,
+                    'kb_per_kpixel': kb_per_kpixel,
+                    'reason': reason
+                })
+    
+    # 按大小排序结果
+    oversized_images.sort(key=lambda x: x['size_kb'], reverse=True)
+    
     # --- Resource Size Output ---
     print("\n--- 资源大小 (已排序) ---")
     sorted_resources = sorted(resources.items(), key=lambda item: item[1]['size'], reverse=True)
@@ -683,6 +982,23 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
             # --- Highlight large resources --- END
         print("-" * 100)
         print(f"总资源大小：{total_size_kb / 1024.0:.2f} MB")
+    
+    # --- 超大尺寸图片输出 ---
+    if oversized_images:
+        print("\n--- 超大尺寸图片 ---")
+        print(f"{'大小 (KB)':>12} | {'尺寸':>15} | {'KB/千像素':>12} | {'问题':^20} | 路径")
+        print("-" * 120)
+        
+        for img in oversized_images:
+            reason_str = ", ".join(img['reason'])
+            print(f"{img['size_kb']:12.2f} | {img['width']:5}x{img['height']:<9} | {img['kb_per_kpixel']:12.2f} | {reason_str:<20} | {img['path']}")
+        
+        print("-" * 120)
+        print(f"找到 {len(oversized_images)} 张尺寸异常的图片，建议优化。")
+        print("• 尺寸过大的图片建议压缩或使用不同分辨率的变体")
+        print("• 压缩率低的图片应使用更高效的压缩算法或更合适的格式（如 WebP）")
+    else:
+        print("\n未发现超大尺寸或压缩率低的图片。")
 
     # --- Pass 2: Find References ---
     print("\n正在扫描资源引用...")
@@ -746,19 +1062,53 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
                                 not ref.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and  # 排除系统前缀
                                 not ref in {'hide', 'show', 'success', 'error', 'warning'}):  # 排除常见非资源词
                                 referenced_identifiers.add(ref.split('.')[0])
+                    
+                    # 检测动态拼接模式
+                    dynamic_matches = DYNAMIC_PATTERN_REGEX.finditer(content)
+                    for match in dynamic_matches:
+                        # 提取所有潜在的静态部分
+                        static_parts = [g for g in match.groups() if g is not None]
+                        for part in static_parts:
+                            if (1 < len(part) < 100 and 
+                                not ('/' in part or '\\' in part) and
+                                not part.startswith(('http', 'www')) and
+                                not part.isdigit() and
+                                not part.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
+                                not part in {'hide', 'show', 'success', 'error', 'warning'}):
+                                referenced_identifiers.add(part.split('.')[0])
+                                
+                                # 由于这是动态拼接，增加额外处理
+                                # 如果静态部分是前缀或后缀，尝试查找可能的完整资源名
+                                for res_id in resources.keys():
+                                    if res_id.startswith(part) or res_id.endswith(part):
+                                        referenced_identifiers.add(res_id)
 
                 # Search in Storyboards/XIBs (XML)
                 elif ext_lower in INTERFACE_FILE_EXTENSIONS:
                     matches = XML_REFERENCE_REGEX.finditer(content)
                     for match in matches:
-                        ref = match.group(1)
-                        if ref and (1 < len(ref) < 100 and 
+                        # 提取所有非空的组
+                        potential_refs = [g for g in match.groups() if g is not None]
+                        for ref in potential_refs:
+                            if (1 < len(ref) < 100 and 
                                   not ('/' in ref or '\\' in ref) and
                                   not ref.startswith(('http', 'www')) and
                                   not ref.isdigit() and
                                   not ref.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
                                   not ref in {'hide', 'show', 'success', 'error', 'warning'}):
-                            referenced_identifiers.add(ref.split('.')[0])
+                                
+                                # 处理带扩展名的资源引用
+                                if '.' in ref:
+                                    base_ref = ref.split('.')[0]
+                                    referenced_identifiers.add(base_ref)
+                                    referenced_identifiers.add(ref)  # 同时添加完整引用
+                                else:
+                                    referenced_identifiers.add(ref)
+                                    
+                                    # 尝试查找可能匹配的资源
+                                    for res_id in resources.keys():
+                                        if res_id.startswith(ref + '.') or res_id == ref:
+                                            referenced_identifiers.add(res_id)
 
                 # Search in Plist files
                 elif ext_lower in PLIST_FILE_EXTENSIONS:
@@ -777,6 +1127,12 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
 
                 # Search in other text-based files (.strings, .json)
                 elif ext_lower in OTHER_SEARCH_EXTENSIONS:
+                    # 使用专门的函数处理其他类型文件
+                    other_refs = scan_other_references(filepath, project_dir)
+                    if other_refs:
+                        referenced_identifiers.update(other_refs)
+                        
+                    # 同时保留旧的代码，以防漏检
                     known_identifiers = set(resources.keys())
                     for identifier in known_identifiers:
                         try:
@@ -806,26 +1162,6 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
     # --- Pass 3: Identify Unused Resources ---
     all_resource_identifiers = set(resources.keys())
     unused_identifiers = all_resource_identifiers - referenced_identifiers
-
-    # 添加资源优化建议
-    optimization_suggestions = [
-        {
-            'type': '图片优化',
-            'suggestion': '1. 使用 ImageOptim 或 TinyPNG 压缩所有图片资源\n2. 考虑使用 WebP 格式替代 PNG/JPG\n3. 检查并移除重复的图片资源\n4. 使用适当的图片分辨率，避免过大尺寸'
-        },
-        {
-            'type': '音频优化',
-            'suggestion': '1. 使用 Audacity 或 XLD 压缩音频文件\n2. 考虑使用 AAC 格式替代 MP3\n3. 检查并移除未使用的音频资源\n4. 根据实际需求选择合适的音频质量'
-        },
-        {
-            'type': '视频优化',
-            'suggestion': '1. 使用 HandBrake 或 FFmpeg 压缩视频文件\n2. 考虑使用 H.264/H.265 编码\n3. 检查并移除未使用的视频资源\n4. 根据实际需求选择合适的视频质量'
-        },
-        {
-            'type': '资源管理',
-            'suggestion': '1. 定期清理未使用的资源文件\n2. 使用资源目录（.xcassets）管理图片资源\n3. 考虑使用资源压缩工具（如 Asset Catalog Compiler）\n4. 检查并移除重复的相似图片'
-        }
-    ]
 
     # Refinement: If 'icon.png' exists and 'icon' is referenced, consider 'icon.png' used.
     # Need to handle cases where references might omit extensions.
@@ -874,6 +1210,81 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
         print("-" * 100)
         print(f"发现 {count_unused} 个可能未使用的资源。")
         print(f"预估总大小：{total_unused_size_kb / 1024.0:.2f} MB")
+
+    # --- 添加资源优化建议 ---
+    optimization_suggestions = [
+        {
+            'type': '图片优化',
+            'suggestion': '1. 使用 ImageOptim 或 TinyPNG 压缩所有图片资源\n2. 考虑使用 WebP 格式替代 PNG/JPG\n3. 检查并移除重复的图片资源\n4. 使用适当的图片分辨率，避免过大尺寸'
+        },
+        {
+            'type': '音频优化',
+            'suggestion': '1. 使用 Audacity 或 XLD 压缩音频文件\n2. 考虑使用 AAC 格式替代 MP3\n3. 检查并移除未使用的音频资源\n4. 根据实际需求选择合适的音频质量'
+        },
+        {
+            'type': '视频优化',
+            'suggestion': '1. 使用 HandBrake 或 FFmpeg 压缩视频文件\n2. 考虑使用 H.264/H.265 编码\n3. 检查并移除未使用的视频资源\n4. 根据实际需求选择合适的视频质量'
+        },
+        {
+            'type': '资源管理',
+            'suggestion': '1. 定期清理未使用的资源文件\n2. 使用资源目录（.xcassets）管理图片资源\n3. 考虑使用资源压缩工具（如 Asset Catalog Compiler）\n4. 检查并移除重复的相似图片'
+        }
+    ]
+    
+    # 根据分析结果，添加具体的针对性建议
+    specific_suggestions = []
+    
+    # 针对未使用资源的建议
+    if len(truly_unused) > 0:
+        unused_size_mb = sum(resources[id]['size'] for id in truly_unused) / (1024.0 * 1024.0)
+        percentage = (unused_size_mb / (total_size_kb / 1024.0)) * 100 if total_size_kb > 0 else 0
+        specific_suggestions.append({
+            'type': '未使用资源清理',
+            'suggestion': f'移除 {len(truly_unused)} 个未使用的资源文件可节省约 {unused_size_mb:.2f} MB ({percentage:.1f}% 的总资源大小)'
+        })
+    
+    # 针对相似图片的建议
+    if similar_image_groups:
+        total_potential_savings = 0
+        for group in similar_image_groups:
+            group_files = []
+            max_size = 0
+            current_group_total_size = 0
+            for img_path in group:
+                if img_path in image_details:
+                    group_files.append(image_details[img_path]['size'])
+                    max_size = max(max_size, image_details[img_path]['size'])
+                    current_group_total_size += image_details[img_path]['size']
+            
+            if len(group_files) > 1:
+                potential_savings = current_group_total_size - max_size
+                total_potential_savings += potential_savings
+        
+        similar_savings_mb = total_potential_savings / (1024.0 * 1024.0)
+        percentage = (similar_savings_mb / (total_size_kb / 1024.0)) * 100 if total_size_kb > 0 else 0
+        specific_suggestions.append({
+            'type': '相似图片合并',
+            'suggestion': f'合并 {len(similar_image_groups)} 组相似图片可节省约 {similar_savings_mb:.2f} MB ({percentage:.1f}% 的总资源大小)'
+        })
+    
+    # 针对超大图片的建议
+    if oversized_images:
+        oversized_count = len(oversized_images)
+        oversized_total_mb = sum(img['size_kb'] for img in oversized_images) / 1024.0
+        potential_saving_mb = oversized_total_mb * 0.7  # 假设可以压缩至原大小的 30%
+        specific_suggestions.append({
+            'type': '超大图片压缩',
+            'suggestion': f'压缩 {oversized_count} 张超大/低压缩图片可节省约 {potential_saving_mb:.2f} MB\n建议使用 WebP 格式并确保尺寸适合目标设备'
+        })
+    
+    # 添加特定建议
+    optimization_suggestions.extend(specific_suggestions)
+    
+    # 输出优化建议
+    print("\n--- 资源优化建议 ---")
+    for suggestion in optimization_suggestions:
+        print(f"\n{suggestion['type']}:")
+        print(suggestion['suggestion'])
 
     # --- Pass 4: Output Similar Images ---
     print("\n--- 相似图片组 (基于感知哈希) ---")
@@ -1183,3 +1594,45 @@ if __name__ == "__main__":
                      large_threshold_kb=args.large_threshold,
                      similarity_threshold=args.similarity_threshold,
                      output_format=args.output)
+
+def scan_code_references(filepath):
+    """扫描代码文件中的资源引用"""
+    references = set()
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        # 使用通用引用模式
+        matches = CODE_REFERENCE_REGEX.finditer(content)
+        for match in matches:
+            # 提取第一个非空的组
+            ref = next((g for g in match.groups() if g is not None), None)
+            # 处理 R.swift 风格 (组 6=类型, 组 7=名称)
+            if match.lastindex >= 7 and match.group(6) and match.group(7): 
+                ref = match.group(7)
+            
+            if ref and (1 < len(ref) < 100 and 
+                       not ('/' in ref or '\\' in ref) and
+                       not ref.startswith(('http', 'www')) and
+                       not ref.isdigit() and
+                       not ref.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
+                       not ref in {'hide', 'show', 'success', 'error', 'warning'}):
+                references.add(ref.split('.')[0])
+        
+        # 使用动态拼接检测模式
+        dynamic_matches = DYNAMIC_PATTERN_REGEX.finditer(content)
+        for match in dynamic_matches:
+            static_parts = [g for g in match.groups() if g is not None]
+            for part in static_parts:
+                if (1 < len(part) < 100 and 
+                    not ('/' in part or '\\' in part) and
+                    not part.startswith(('http', 'www')) and
+                    not part.isdigit() and
+                    not part.startswith(('CF', 'NS', 'UI', 'LAUNCH')) and
+                    not part in {'hide', 'show', 'success', 'error', 'warning'}):
+                    references.add(part.split('.')[0])
+                    
+    except Exception as e:
+        print(f"警告：无法扫描代码文件 {filepath}：{e}")
+    
+    return references
