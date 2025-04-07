@@ -15,6 +15,7 @@ import hashlib
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm  # 添加进度条库
+import math # 用于计算图片像素
 
 # --- Dependencies Check ---
 try:
@@ -82,11 +83,17 @@ HTML_TEMPLATE = """
                 {resource_table}
             </table>
             <p>总资源大小: {total_size_mb:.2f} MB</p>
+            <p>总图片资源大小: {total_image_size_mb:.2f} MB</p>
         </div>
 
         <div class="section">
             <h2 class="section-title">可能未使用的资源</h2>
             {unused_resources}
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Asset Catalog 分析</h2>
+            {asset_catalog_analysis}
         </div>
 
         <div class="section">
@@ -97,6 +104,8 @@ HTML_TEMPLATE = """
         <div class="section">
             <h2 class="section-title">资源优化建议</h2>
             {optimization_suggestions}
+            <h3>WebP 转换建议</h3>
+            {webp_suggestions}
         </div>
     </div>
 </body>
@@ -1559,7 +1568,8 @@ def analyze_resources(project_dir, large_threshold_kb=100, similarity_threshold=
             unused_resources=unused_resources_html,
             similar_images=similar_images_html,
             optimization_suggestions=optimization_suggestions_html,
-            total_size_mb=output_data['total_size_mb']
+            total_size_mb=output_data['total_size_mb'],
+            total_image_size_mb=sum(img['size'] for img in output_data['resources']) / (1024.0 * 1024.0)
         )
 
         # Write HTML file
@@ -1659,3 +1669,668 @@ def scan_code_references(filepath):
         print(f"警告：无法扫描代码文件 {filepath}：{e}")
     
     return references
+
+# --- Asset Catalog Analysis ---
+
+def analyze_asset_catalog(asset_path: Path, all_resources: dict):
+    """分析单个 Asset Catalog (.xcassets) 目录。"""
+    results = {
+        "sets_analyzed": 0,
+        "imagesets": [],
+        "issues": [] # 存储发现的问题
+    }
+    
+    # Asset Catalog 本身不需要添加到 all_resources，我们关心它内部的 imageset 等
+
+    for item_path in asset_path.rglob('*'):
+        if item_path.is_dir() and item_path.suffix in ASSET_TYPES:
+            if item_path.suffix == '.imageset':
+                analysis = analyze_imageset(item_path, all_resources)
+                if analysis:
+                     results["sets_analyzed"] += 1
+                     results["imagesets"].append(analysis)
+                     results["issues"].extend(analysis["issues"])
+            # TODO: 可以添加对其他类型 (.colorset, .symbolset 等) 的分析
+
+    return results
+
+def analyze_imageset(imageset_path: Path, all_resources: dict):
+    """分析单个 .imageset 目录。"""
+    contents_path = imageset_path / "Contents.json"
+    analysis = {
+        "name": imageset_path.stem,
+        "path": str(imageset_path.relative_to(project_root)), # Use global project_root
+        "images": [],
+        "issues": [],
+        "total_size": 0,
+        "referenced_in": [] # Add this field
+    }
+
+    if not contents_path.exists():
+        analysis["issues"].append({"type": "error", "message": "未找到 Contents.json"})
+        return analysis
+
+    try:
+        with open(contents_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        analysis["issues"].append({"type": "error", "message": "Contents.json 解析失败"})
+        return analysis
+    except Exception as e:
+        analysis["issues"].append({"type": "error", "message": f"读取 Contents.json 时出错: {e}"})
+        return analysis
+
+    has_1x = False
+    has_2x = False
+    has_3x = False
+    idioms = set()
+    gamuts = set()
+    appearances = set()
+    defined_files = set()
+
+    if "images" in data:
+        for img_info in data["images"]:
+            filename = img_info.get("filename")
+            if filename:
+                defined_files.add(filename)
+                img_path = imageset_path / filename
+                if img_path.exists():
+                    size = get_file_size(str(img_path))
+                    analysis["images"].append({"filename": filename, "size": size})
+                    analysis["total_size"] += size
+                    # 将 imageset 内部的图片文件也记录到 all_resources 中，方便统一处理大小和引用
+                    file_key = str(img_path.relative_to(project_root))
+                    all_resources[file_key] = {
+                        'size': size,
+                        'type': 'Image',
+                        'asset_catalog_set': analysis["name"],
+                        'referenced_in': set() # 初始化引用集合
+                    }
+                else:
+                    analysis["issues"].append({"type": "warning", "message": f"Contents.json 中引用的文件 '{filename}' 不存在"})
+
+            scale = img_info.get("scale")
+            if scale == "1x": has_1x = True
+            if scale == "2x": has_2x = True
+            if scale == "3x": has_3x = True
+
+            idiom = img_info.get("idiom")
+            if idiom: idioms.add(idiom)
+
+            gamut = img_info.get("display-gamut")
+            if gamut: gamuts.add(gamut)
+
+            appearance = img_info.get("appearances")
+            if appearance:
+                 for app_dict in appearance:
+                     if app_dict.get("appearance") == "luminosity":
+                         appearances.add(app_dict.get("value")) # e.g., "light", "dark"
+
+        # 检查变体完整性
+        if not has_3x and 'iphone' in idioms:
+            analysis["issues"].append({"type": "warning", "message": "缺少 @3x 变体，可能在高分辨率 iPhone 上模糊或拉伸。"})
+        if not has_2x and ('iphone' in idioms or 'ipad' in idioms or 'mac' in idioms):
+            # 2x is usually necessary unless it's vector or single scale
+            is_vector = any(img.get("properties", {}).get("template-rendering-intent") == "vector" for img in data.get("images",[]))
+            preserves_vector = data.get("properties",{}).get("preserves-vector-representation")
+            if not is_vector and not preserves_vector:
+                analysis["issues"].append({"type": "info", "message": "缺少 @2x 停用，如果不是矢量图，可能在非 Retina 设备上需要。"}) # Lower severity
+
+        # 检查冗余文件
+        actual_files = {f.name for f in imageset_path.glob('*') if f.is_file() and f.name != 'Contents.json'}
+        undefined_files = actual_files - defined_files
+        if undefined_files:
+            for fname in undefined_files:
+                 analysis["issues"].append({"type": "warning", "message": f"文件 '{fname}' 存在于目录中，但在 Contents.json 未定义。"})
+                 # 将未定义的文件也加入 all_resources，以便检测是否被其他地方引用
+                 undefined_path = imageset_path / fname
+                 file_key_undef = str(undefined_path.relative_to(project_root))
+                 size_undef = get_file_size(str(undefined_path))
+                 all_resources[file_key_undef] = {
+                    'size': size_undef,
+                    'type': 'Image',
+                    'asset_catalog_set': analysis["name"] + " (未定义)",
+                    'referenced_in': set()
+                }
+
+
+    # Check for single scale vector images
+    # if len(analysis["images"]) == 1 and has_1x and not has_2x and not has_3x:
+    #     img_info = data.get("images", [])[0]
+    #     props = data.get("properties", {})
+    #     filename = img_info.get("filename")
+    #     if filename and (filename.endswith(".pdf") or filename.endswith(".svg")):
+    #         if props.get("preserves-vector-representation"):
+    #              analysis["issues"].append({"type": "info", "message": "检测到单比例矢量图像。"})
+    #         else:
+    #              analysis["issues"].append({"type": "warning", "message": f"矢量文件 '{filename}' 未设置 'Preserve Vector Representation'。"})
+
+    # 检查是否存在暗黑模式但只有一个资源的情况
+    if "dark" in appearances and len(analysis["images"]) == len([a for a in appearances if a]): # Check if only one appearance value used across images
+          pass # Might need more logic if images can have *different* appearances
+
+    return analysis
+
+
+# --- WebP Suggestion --- WEB_P_GAIN_ESTIMATE = 0.7 # 假设 WebP 平均节省 30% 体积 WEBP_SUGGESTION_THRESHOLD_KB = 50 # 只对大于 50KB 的图片提出建议 def generate_webp_suggestions(resources_data: list, top_n=10):
+    """生成 WebP 转换建议。"""
+    suggestions = []
+    webp_present = any(res['identifier'].lower().endswith('.webp') for res in resources_data)
+    
+    if webp_present:
+        # print("检测到项目中已使用 WebP 格式，不生成转换建议。")
+        return ["<li>检测到项目中已使用 WebP 格式，不重复生成转换建议。</li>"]
+
+    potential_candidates = []
+    for resource in resources_data:
+        ext = Path(resource['identifier']).suffix.lower()
+        if ext in {'.png', '.jpg', '.jpeg'}:
+            size_kb = resource['size'] / 1024.0
+            if size_kb > WEBP_SUGGESTION_THRESHOLD_KB:
+                 potential_candidates.append(resource)
+
+    if not potential_candidates:
+        return ["<li>未发现适合转换为 WebP 的大型 PNG/JPG 图片。</li>"]
+
+    # 按大小排序
+    potential_candidates.sort(key=lambda x: x['size'], reverse=True)
+
+    suggestions.append(f"<li>考虑将以下大型 PNG/JPG 图片转换为 WebP 格式以减小体积 (预估可节省约 {int((1-WEB_P_GAIN_ESTIMATE)*100)}%):</li>")
+    suggestions.append("<ul>")
+    total_estimated_saving_bytes = 0
+    count = 0
+    for candidate in potential_candidates[:top_n]:
+        estimated_saving = candidate['size'] * (1 - WEB_P_GAIN_ESTIMATE)
+        total_estimated_saving_bytes += estimated_saving
+        count += 1
+        suggestions.append(f"  <li>{candidate['identifier']} ({format_size(candidate['size'])}) - 预估节省: {format_size(estimated_saving)}</li>")
+
+    suggestions.append("</ul>")
+    suggestions.append(f"<li>转换 Top {count} 张图片预估总共可节省: <strong>{format_size(total_estimated_saving_bytes)}</strong></li>")
+    suggestions.append("<li>注意：WebP 转换可能需要调整部署目标或添加依赖库 (如 libwebp)。请在转换前进行充分测试。</li>")
+
+    return suggestions
+
+# --- Resource Processing Enhancement ---
+
+def scan_resources(project_dir: Path, excluded_dirs: set, excluded_patterns: set):
+    """扫描项目目录，查找所有资源文件和 Asset Catalog。"""
+    all_files = {}
+    asset_catalogs_analysis = []
+    total_files_scanned = 0
+    print("开始扫描资源文件...")
+    
+    # 使用 Path.rglob 进行递归扫描
+    for file_path in tqdm(project_dir.rglob('*'), desc="扫描文件", unit=" 文件"):
+        total_files_scanned += 1
+        relative_path_str = str(file_path.relative_to(project_dir))
+        parts = file_path.parts
+        
+        # 检查是否应排除
+        if any(part in excluded_dirs for part in parts) or \
+           any(pattern in relative_path_str for pattern in excluded_patterns):
+            continue
+            
+        if file_path.is_file():
+            ext = file_path.suffix.lower()
+            # 常规资源文件（非 Asset Catalog 内部文件，将在下面处理）
+            if ext in RESOURCE_EXTENSIONS and not any(part.endswith('.xcassets') for part in parts):
+                size = get_file_size(str(file_path))
+                # 使用相对路径作为 key
+                all_files[relative_path_str] = {
+                    'size': size,
+                    'type': ext,
+                    'referenced_in': set()
+                }
+        elif file_path.is_dir() and file_path.name.endswith('.xcassets'):
+            print(f"\n发现 Asset Catalog: {relative_path_str}")
+            # 分析 Asset Catalog，并将内部文件添加到 all_files
+            catalog_analysis = analyze_asset_catalog(file_path, all_files)
+            asset_catalogs_analysis.append(catalog_analysis)
+            print(f"完成分析 Asset Catalog: {relative_path_str}, 问题数: {len(catalog_analysis.get('issues',[]))}")
+
+    print(f"\n完成扫描，共扫描 {total_files_scanned} 个条目，找到 {len(all_files)} 个资源文件。")
+    return all_files, asset_catalogs_analysis
+
+# ... (find_references, analyze_project 等函数需要适配新的 all_files 结构)
+
+def find_references(project_dir: Path, resources: dict, excluded_dirs: set, excluded_patterns: set):
+    """在代码和配置文件中查找对资源的引用。"""
+    print("开始查找资源引用...")
+    potential_references = set()
+    dynamic_references = set() # 用于存储动态引用模式的根名称
+
+    files_to_scan = []
+    for file_path in project_dir.rglob('*'):
+        relative_path_str = str(file_path.relative_to(project_dir))
+        parts = file_path.parts
+        # 排除目录检查
+        if any(part in excluded_dirs for part in parts) or \
+           any(pattern in relative_path_str for pattern in excluded_patterns):
+            continue
+            
+        if file_path.is_file():
+            ext = file_path.suffix.lower()
+            if ext in CODE_FILE_EXTENSIONS or ext in INTERFACE_FILE_EXTENSIONS or \
+               ext in PLIST_FILE_EXTENSIONS or ext in OTHER_SEARCH_EXTENSIONS:
+                 files_to_scan.append(file_path)
+
+    # 使用多线程加速文件读取和正则匹配
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+         future_to_path = {executor.submit(scan_file_for_references, path): path for path in files_to_scan}
+         for future in tqdm(as_completed(future_to_path), total=len(files_to_scan), desc="分析引用", unit=" 文件"):
+             path = future_to_path[future]
+             try:
+                 file_refs, dynamic_refs = future.result()
+                 potential_references.update(file_refs)
+                 dynamic_references.update(dynamic_refs)
+             except Exception as exc:
+                 print(f'\n文件 {path} 生成引用时出错: {exc}')
+
+    print(f"\n完成引用查找，找到 {len(potential_references)} 个潜在静态引用和 {len(dynamic_references)} 个动态引用模式。")
+
+    # 更新 resources 字典中的引用信息
+    referenced_keys = set()
+    resource_identifiers = {Path(key).stem: key for key in resources.keys()} # Map stem to full key
+    resource_full_paths = set(resources.keys())
+
+    for ref in potential_references:
+        # 1. 完全匹配 (e.g., "image.png")
+        if ref in resource_full_paths:
+            resources[ref]['referenced_in'].add("静态直接引用")
+            referenced_keys.add(ref)
+            continue
+        
+        # 2. 匹配文件名 (去除扩展名, e.g., "image") - 主要用于 Asset Catalog
+        ref_stem = Path(ref).stem
+        if ref_stem in resource_identifiers:
+             res_key = resource_identifiers[ref_stem]
+             resources[res_key]['referenced_in'].add("静态名称引用")
+             referenced_keys.add(res_key)
+             # 如果是 Asset Catalog 引用，标记其内的所有文件也被引用
+             if resources[res_key].get('asset_catalog_set'):
+                 set_name = resources[res_key]['asset_catalog_set']
+                 for rk, r_info in resources.items():
+                     if r_info.get('asset_catalog_set') == set_name:
+                         r_info['referenced_in'].add("静态名称引用 (来自 Set)")
+                         referenced_keys.add(rk)
+             continue
+
+        # 3. 可能的本地化字符串引用（检查 .lproj 目录）
+        # This requires a more complex check involving .strings files, handle later
+
+    # 4. 处理动态引用 (标记包含动态模式前缀/后缀的资源为可能被引用)
+    for dyn_ref in dynamic_references:
+         matched_dynamic = False
+         for res_key in resource_full_paths:
+             res_name = Path(res_key).name # Get filename.ext
+             if dyn_ref in res_name: # Simple substring check
+                 resources[res_key]['referenced_in'].add("动态模式引用 (可能)")
+                 referenced_keys.add(res_key)
+                 matched_dynamic = True
+         # if matched_dynamic:
+         #      print(f"动态模式 '{dyn_ref}' 匹配到资源")
+
+
+    # 计算未使用资源
+    unused_resources = []
+    for key, data in resources.items():
+        # If a resource has no references after checks
+        if not data['referenced_in']:
+             # Don't immediately flag files inside asset catalogs if the SET itself is referenced
+             is_in_referenced_set = False
+             if data.get('asset_catalog_set') and not data['asset_catalog_set'].endswith("(未定义)"):
+                 set_name = data['asset_catalog_set']
+                 # Find the primary key for this set (might be complex if no single file represents it)
+                 # Simplified: Check if ANY file from this set was referenced by name
+                 for rk_other, r_info_other in resources.items():
+                     if r_info_other.get('asset_catalog_set') == set_name and \
+                        any("静态名称引用" in s for s in r_info_other.get('referenced_in', set())):
+                         is_in_referenced_set = True
+                         break
+
+             if not is_in_referenced_set:
+                 unused_resources.append({
+                     'identifier': key,
+                     'size': data['size'],
+                     'type': data['type']
+                 })
+
+    print(f"分析完成，发现 {len(unused_resources)} 个可能未使用的资源。")
+    return unused_resources
+
+# --- Main Analysis Function --- def analyze_project(project_dir_str: str, large_threshold_kb: int, similarity_threshold: int, output_format: str):
+    """主分析函数。"""
+    start_time = datetime.now()
+    global project_root # Make project_root global for helper functions
+    project_root = Path(project_dir_str).resolve()
+    
+    if not project_root.is_dir():
+        print(f"错误：项目路径 '{project_dir_str}' 无效或不是一个目录。")
+        sys.exit(1)
+
+    # --- 1. 扫描资源文件和 Asset Catalogs ---
+    all_resources, asset_catalogs_analysis = scan_resources(project_root, EXCLUDED_DIRS, EXCLUDED_DIR_PATTERNS)
+
+    # --- 2. 查找资源引用 ---
+    unused_resources_list = find_references(project_root, all_resources, EXCLUDED_DIRS, EXCLUDED_DIR_PATTERNS)
+
+    # --- 3. 相似图片检测 (基于 all_resources 中识别的图片) ---
+    image_files_to_hash = {
+         key: data for key, data in all_resources.items()
+         if Path(key).suffix.lower() in IMAGE_EXTENSIONS
+    }
+    similar_images_groups = find_similar_images(image_files_to_hash, similarity_threshold, project_root)
+
+    # --- 4. 格式化资源数据以便报告 ---
+    resources_data_list = []
+    for key, data in all_resources.items():
+        # 使用标识符（相对路径）
+        resources_data_list.append({
+            'identifier': key,
+            'size': data['size'],
+            'type': data.get('type', Path(key).suffix),
+            'path': str(project_root / key), # Add absolute path for context
+            'referenced': bool(data.get('referenced_in'))
+        })
+    # 按大小排序
+    resources_data_list.sort(key=lambda x: x['size'], reverse=True)
+
+    # --- 5. 生成优化建议 (包括超大图片等) ---
+    optimization_suggestions_list = generate_optimization_suggestions(
+        resources_data_list,
+        large_threshold_kb,
+        unused_resources_list,
+        similar_images_groups
+    )
+    # --- 6. 生成 WebP 建议 ---
+    webp_suggestions_list = generate_webp_suggestions(resources_data_list)
+
+    # --- 7. 准备输出数据 ---
+    total_size_bytes = sum(r['size'] for r in resources_data_list)
+    output_data = {
+        'project_dir': str(project_root),
+        'timestamp': start_time.isoformat(),
+        'total_size_bytes': total_size_bytes,
+        'total_size_mb': total_size_bytes / (1024.0 * 1024.0),
+        'resource_count': len(resources_data_list),
+        'resources': resources_data_list,
+        'unused_resources': sorted(unused_resources_list, key=lambda x: x['size'], reverse=True),
+        'asset_catalog_analysis': asset_catalogs_analysis,
+        'similar_images': similar_images_groups,
+        'optimization_suggestions': optimization_suggestions_list,
+        'webp_suggestions': webp_suggestions_list
+    }
+
+    # --- 8. 生成报告 ---
+    generate_report(output_data, output_format, large_threshold_kb)
+
+    end_time = datetime.now()
+    print(f"\n分析总耗时: {end_time - start_time}")
+
+# ... (generate_report 和 main 函数需要更新以包含新数据)
+def generate_report(output_data: dict, output_format: str, large_threshold_kb: int):
+    """根据指定的格式生成最终报告。"""
+    timestamp = datetime.fromisoformat(output_data['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+    project_dir = output_data['project_dir']
+
+    # --- 通用数据准备 ---
+    resource_table_rows = ""
+    large_threshold_bytes = large_threshold_kb * 1024
+    for res in output_data['resources'][:100]: # Limit table size for readability
+         size_kb = res['size'] / 1024.0
+         is_large = res['size'] > large_threshold_bytes
+         row_class = ' class="large-resource"' if is_large else ''
+         # 显示相对路径作为标识符
+         identifier = res['identifier']
+         resource_table_rows += f'<tr{row_class}><td>{size_kb:.2f}</td><td>{res["type"]}</td><td>{identifier}</td><td>{res["path"]}</td></tr>\n'
+    if len(output_data['resources']) > 100:
+        resource_table_rows += "<tr><td colspan='4'>... (只显示最大的100个资源) ...</td></tr>"
+
+    unused_resources_html = "<p>未发现可能未使用的资源。</p>" # Default message
+    if output_data['unused_resources']:
+        unused_resources_html = "<table><tr><th>大小 (KB)</th><th>类型</th><th>标识符 (相对路径)</th></tr>"
+        for res in output_data['unused_resources']:
+            size_kb = res['size'] / 1024.0
+            unused_resources_html += f'<tr><td>{size_kb:.2f}</td><td>{res["type"]}</td><td>{res["identifier"]}</td></tr>\n'
+        unused_resources_html += "</table><p class='note'>注意：未使用检测基于静态分析，可能存在误报（特别是动态引用或间接引用），请在删除前仔细确认。</p>"
+
+    similar_images_html = "<p>未发现相似图片组。</p>"
+    if output_data['similar_images']:
+        similar_images_html = ""
+        group_count = 0
+        for i, group in enumerate(output_data['similar_images']):
+            group_count += 1
+            total_group_size = sum(img_data['size'] for img_data in group['files'])
+            similar_images_html += f"<h4>相似组 {group_count} (总大小: {format_size(total_group_size)}, 哈希距离: {group['max_distance']})</h4><ul>"
+            for img_data in group['files']:
+                similar_images_html += f"<li>{img_data['path']} ({format_size(img_data['size'])})</li>"
+            similar_images_html += "</ul>"
+
+    optimization_suggestions_html = "<ul>" + "\n".join(output_data['optimization_suggestions']) + "</ul>"
+    webp_suggestions_html = "<ul>" + "\n".join(output_data['webp_suggestions']) + "</ul>"
+
+    asset_catalog_analysis_html = "<p>未找到或未分析 Asset Catalog。</p>"
+    if output_data['asset_catalog_analysis']:
+        asset_catalog_analysis_html = ""
+        for catalog in output_data['asset_catalog_analysis']:
+             # Assuming asset_path is now relative within catalog analysis data
+             # catalog_rel_path = catalog.get('path', '未知路径')
+             catalog_name = Path(catalog.get('path', '未知AssetCatalog')).name
+             asset_catalog_analysis_html += f"<h3>{catalog_name} ({catalog.get('sets_analyzed', 0)} 个 Set)</h3>"
+             if catalog.get("issues"):
+                 asset_catalog_analysis_html += "<ul><strong>发现问题:</strong>"
+                 for issue in catalog["issues"]:
+                     level_class = "error" if issue["type"] == "error" else ("warning" if issue["type"] == "warning" else "info")
+                     asset_catalog_analysis_html += f"<li class='{level_class}'>[{issue['type'].upper()}] {issue['message']}</li>"
+                 asset_catalog_analysis_html += "</ul>"
+             else:
+                 asset_catalog_analysis_html += "<p>未发现明显问题。</p>"
+             # Optionally add details about imagesets within the catalog
+             # if catalog.get('imagesets'):
+             #     asset_catalog_analysis_html += "<h4>Image Sets:</h4><ul>"
+             #     for imgset in catalog['imagesets']:
+             #         asset_catalog_analysis_html += f"<li>{imgset['name']} ({len(imgset['images'])} images, {format_size(imgset['total_size'])})</li>"
+             #     asset_catalog_analysis_html += "</ul>"
+
+
+    # --- 根据格式输出 ---
+    if output_format == OutputFormat.HTML:
+         # 使用增强的 HTML 模板
+         total_image_size = sum(res['size'] for res in output_data['resources'] if Path(res['identifier']).suffix.lower() in IMAGE_EXTENSIONS)
+         html_content = HTML_TEMPLATE.format(
+             timestamp=timestamp,
+             project_dir=project_dir,
+             resource_table=resource_table_rows,
+             unused_resources=unused_resources_html,
+             asset_catalog_analysis=asset_catalog_analysis_html,
+             similar_images=similar_images_html,
+             optimization_suggestions=optimization_suggestions_html,
+             webp_suggestions=webp_suggestions_html,
+             total_size_mb=output_data['total_size_mb'],
+             total_image_size_mb=total_image_size / (1024.0 * 1024.0)
+         )
+         output_filename = "resource_analysis_report.html"
+         try:
+             with open(output_filename, 'w', encoding='utf-8') as f:
+                 f.write(html_content)
+             print(f"HTML 报告已生成: {output_filename}")
+         except IOError as e:
+             print(f"错误：无法写入 HTML 文件 {output_filename}: {e}")
+
+    elif output_format == OutputFormat.JSON:
+         output_filename = "resource_analysis_report.json"
+         # Exclude full path from JSON for cleaner output
+         clean_resources = [
+             {k: v for k, v in res.items() if k != 'path'} for res in output_data['resources']
+         ]
+         output_data['resources'] = clean_resources # Overwrite with cleaned data
+         # Clean similar images paths too
+         for group in output_data.get('similar_images', []):
+              for file_data in group.get('files', []):
+                   if 'full_path' in file_data: del file_data['full_path']
+
+         try:
+             with open(output_filename, 'w', encoding='utf-8') as f:
+                 json.dump(output_data, f, indent=2, ensure_ascii=False)
+             print(f"JSON 报告已生成: {output_filename}")
+         except (IOError, TypeError) as e:
+             print(f"错误：无法写入 JSON 文件 {output_filename}: {e}")
+
+    elif output_format == OutputFormat.CSV:
+        generate_csv_report(output_data)
+
+    else: # Default to TEXT
+         print("--- iOS 资源分析报告 ---")
+         print(f"项目路径: {project_dir}")
+         print(f"生成时间: {timestamp}")
+         print(f"总资源大小: {output_data['total_size_mb']:.2f} MB")
+         print(f"资源数量: {output_data['resource_count']}")
+         print("\n--- 资源大小统计 (Top 50) ---")
+         print("{:<10} {:<8} {:<60} {:<60}".format("大小(KB)", "类型", "标识符", "路径"))
+         print("-" * 140)
+         for res in output_data['resources'][:50]:
+             size_kb = res['size'] / 1024.0
+             is_large = res['size'] > large_threshold_bytes
+             large_marker = "*" if is_large else " "
+             print(f"{size_kb:<9.2f}{large_marker} {res['type']:<8} {res['identifier']:<60} {res['path']:<60}")
+         if len(output_data['resources']) > 50: print("... (只显示最大的50个资源) ...")
+         if any(res['size'] > large_threshold_bytes for res in output_data['resources']): print(f"(* 表示大于 {large_threshold_kb} KB)")
+
+         print("\n--- Asset Catalog 分析 ---")
+         if output_data['asset_catalog_analysis']:
+             for catalog in output_data['asset_catalog_analysis']:
+                 catalog_name = Path(catalog.get('path', '未知AssetCatalog')).name
+                 print(f"  Catalog: {catalog_name} ({catalog.get('sets_analyzed', 0)} 个 Set)")
+                 if catalog.get("issues"):
+                     print("    发现问题:")
+                     for issue in catalog["issues"]:
+                         print(f"      - [{issue['type'].upper()}] {issue['message']}")
+                 else:
+                     print("    未发现明显问题。")
+         else:
+             print("  未找到或未分析 Asset Catalog。")
+
+
+         print("\n--- 可能未使用的资源 ---")
+         if output_data['unused_resources']:
+             print("{:<10} {:<8} {:<60}".format("大小(KB)", "类型", "标识符 (相对路径)"))
+             print("-" * 80)
+             for res in output_data['unused_resources']:
+                 size_kb = res['size'] / 1024.0
+                 print(f"{size_kb:<9.2f} {res['type']:<8} {res['identifier']:<60}")
+             print("\n注意：未使用检测基于静态分析，可能存在误报。")
+         else:
+             print("未发现可能未使用的资源。")
+
+         print("\n--- 相似图片组 ---")
+         if output_data['similar_images']:
+             group_count = 0
+             for i, group in enumerate(output_data['similar_images']):
+                 group_count += 1
+                 total_group_size = sum(img_data['size'] for img_data in group['files'])
+                 print(f"  相似组 {group_count} (总大小: {format_size(total_group_size)}, 最大哈希距离: {group['max_distance']}):")
+                 for img_data in group['files']:
+                      # Use relative path from group data
+                      rel_path = img_data.get('path', '未知路径')
+                      print(f"    - {rel_path} ({format_size(img_data['size'])})")
+         else:
+             print("未发现相似图片组。")
+
+         print("\n--- 资源优化建议 ---")
+         if output_data['optimization_suggestions']:
+             for suggestion in output_data['optimization_suggestions']:
+                 # Simple text conversion from HTML list items
+                 clean_suggestion = suggestion.replace("<li>", "- ").replace("</li>", "").replace("<strong>", "").replace("</strong>", "")
+                 print(clean_suggestion)
+         else:
+             print("无特定优化建议。")
+
+         print("\n--- WebP 转换建议 ---")
+         if output_data['webp_suggestions']:
+              for suggestion in output_data['webp_suggestions']:
+                  clean_suggestion = suggestion.replace("<li>", "- ").replace("</li>", "").replace("<strong>", "").replace("</strong>", "").replace("<ul>","").replace("</ul>","").strip()
+                  if clean_suggestion: # Avoid printing empty lines from ul tags
+                       print(clean_suggestion)
+         else:
+              print("无 WebP 转换建议。")
+
+def generate_csv_report(output_data: dict):
+    """生成 CSV 格式的报告文件。"""
+    files_created = []
+
+    # 1. Resource Size Report
+    res_size_file = "resource_size_report.csv"
+    try:
+        with open(res_size_file, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Identifier (Relative Path)', 'Size (Bytes)', 'Type', 'Is Referenced'])
+            for res in output_data['resources']:
+                writer.writerow([res['identifier'], res['size'], res['type'], res['referenced']])
+        files_created.append(res_size_file)
+    except IOError as e:
+        print(f"错误: 无法写入 CSV 文件 {res_size_file}: {e}")
+
+    # 2. Unused Resources Report
+    unused_file = "unused_resources.csv"
+    if output_data['unused_resources']:
+        try:
+            with open(unused_file, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Identifier (Relative Path)', 'Size (Bytes)', 'Type'])
+                for res in output_data['unused_resources']:
+                    writer.writerow([res['identifier'], res['size'], res['type']])
+            files_created.append(unused_file)
+        except IOError as e:
+            print(f"错误: 无法写入 CSV 文件 {unused_file}: {e}")
+
+    # 3. Similar Images Report
+    similar_file = "similar_images.csv"
+    if output_data['similar_images']:
+        try:
+            with open(similar_file, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Group ID', 'Max Hash Distance', 'File Path (Relative)', 'Size (Bytes)'])
+                for i, group in enumerate(output_data['similar_images']):
+                    group_id = i + 1
+                    for img_data in group['files']:
+                        writer.writerow([group_id, group['max_distance'], img_data['path'], img_data['size']])
+            files_created.append(similar_file)
+        except IOError as e:
+            print(f"错误: 无法写入 CSV 文件 {similar_file}: {e}")
+
+    # 4. Optimization Suggestions (including WebP)
+    opt_file = "optimization_suggestions.csv"
+    all_suggestions = output_data['optimization_suggestions'] + ["--- WebP Suggestions ---"] + output_data['webp_suggestions']
+    if all_suggestions:
+        try:
+            with open(opt_file, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Suggestion'])
+                for suggestion in all_suggestions:
+                     # Clean HTML tags for CSV
+                     clean_suggestion = suggestion.replace("<li>", "").replace("</li>", "").replace("<strong>", "").replace("</strong>", "").replace("<ul>","").replace("</ul>","").strip()
+                     if clean_suggestion and clean_suggestion != "--- WebP Suggestions ---":
+                         writer.writerow([clean_suggestion])
+            files_created.append(opt_file)
+        except IOError as e:
+            print(f"错误: 无法写入 CSV 文件 {opt_file}: {e}")
+
+    if files_created:
+        print(f"CSV 报告文件已生成: {', '.join(files_created)}")
+    else:
+        print("未能生成任何 CSV 文件。")
+
+# --- Main Execution --- if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='分析iOS项目资源文件，查找未使用资源和相似图片。')
+    parser.add_argument('project_dir', help='iOS项目根目录的路径')
+    parser.add_argument('--large-threshold', type=int, default=100,
+                        help='大文件阈值（KB），超过此值的资源将被标记')
+    parser.add_argument('--similarity-threshold', type=int, default=5,
+                        help='图片相似度阈值（汉明距离），值越小表示要求越相似')
+    parser.add_argument('--output', choices=[OutputFormat.TEXT, OutputFormat.JSON, OutputFormat.HTML, OutputFormat.CSV],
+                        default=OutputFormat.TEXT, help='输出格式')
+
+    args = parser.parse_args()
+
+    analyze_project(args.project_dir, args.large_threshold, args.similarity_threshold, args.output)

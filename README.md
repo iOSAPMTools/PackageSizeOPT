@@ -6,7 +6,14 @@
 3. [代码优化](#代码优化)
 4. [编译优化](#编译优化)
 5. [工具使用](#工具使用)
-6. [持续优化](#持续优化)
+   - [IPA 分析器 (ipa_analyzer.py)](#ipa-分析器-ipa_analyzerpy)
+   - [资源分析器 (resource_analyzer.py)](#资源分析器-resource_analyzerpy)
+   - [Link Map 分析器 (linkmap_analyzer_pro.py)](#link-map-分析器-linkmap_analyzer_propy)
+   - [构建设置检查器 (build_settings_checker.py)](#构建设置检查器-build_settings_checkerpy)
+6. [持续优化与 CI/CD 集成](#持续优化与-cicd-集成)
+   - [建立监控机制](#建立监控机制)
+   - [优化流程](#优化流程)
+   - [CI/CD 集成示例](#cicd-集成示例)
 
 ## 概述
 
@@ -157,26 +164,62 @@ iOS应用的包体积直接影响用户的下载意愿、安装速度和存储�
 
 ## 工具使用
 
-### 1. Resource Analyzer
-Resource Analyzer是一个强大的资源分析工具，可以帮助您：
-- 检测未使用的资源文件
-- 识别相似图片
-- 分析资源大小分布
-- 提供优化建议
+本仓库提供了一系列 Python 脚本来辅助进行包体积分析：
 
-使用方法：
-```bash
-python resource_analyzer.py 项目路径 [选项]
-```
+### IPA 分析器 (ipa_analyzer.py)
 
-### 2. Link Map分析工具
-Link Map分析工具可以帮助您：
-- 分析二进制构成
-- 识别大文件
-- 检测重复代码
-- 提供代码优化建议
+用于分析 IPA 文件的整体构成，包括 Payload 大小、SwiftSupport 大小、符号文件大小等。支持历史版本对比，生成 HTML 报告。
 
-## 持续优化
+- **主要功能**: 测量 IPA 各主要组成部分的大小。
+- **使用场景**: 跟踪整体包体积变化趋势，快速定位是代码、资源还是其他部分导致体积增加。
+- **文档**: [ipa_analyzer.md](ipa_analyzer.md)
+
+### 资源分析器 (resource_analyzer.py)
+
+强大的资源文件分析工具，可以：
+
+- 检测未使用的资源文件 (图片、音频、配置等)。
+- 识别视觉上相似的图片资源。
+- 分析资源大小分布，找出大文件。
+- **(新增)** 分析 Asset Catalog (`.xcassets`) 内部结构，检查图片变体 (如 @2x, @3x) 是否齐全或冗余。
+- **(新增)** 提供 WebP 格式转换建议，估算潜在的体积节省。
+- 提供多种优化建议。
+- 支持 Text, JSON, HTML, CSV 多种输出格式。
+
+- **主要功能**: 深入分析项目中的各类资源文件。
+- **使用场景**: 清理无用资源、优化图片资源、检查 Asset Catalog 配置。
+- **依赖**: `Pillow`, `ImageHash`, `tqdm` (`pip install Pillow ImageHash tqdm`)
+- **文档**: [resource_analyzer.md](resource_analyzer.md)
+
+### Link Map 分析器 (linkmap_analyzer_pro.py)
+
+用于深入分析 Xcode 生成的 Link Map 文件，了解应用二进制代码的构成：
+
+- 按库/模块聚合代码大小。
+- 按目标文件 (`.o`) 聚合代码大小。
+- **(新增)** 尝试对 Swift/C++ 符号进行去混淆 (Demangling)，提高可读性 (依赖 `swift-demangle` 和 `c++filt` 工具)。
+- **(新增)** 提供潜在问题警告，如体积异常大的符号、基于名称和大小相似性推测的潜在重复代码 (启发式，需人工确认)。
+- 支持版本对比功能。
+- 支持 Text, JSON, CSV, HTML 多种输出格式，HTML 包含可视化图表。
+
+- **主要功能**: 分析代码体积构成，定位主要的代码来源。
+- **使用场景**: 找出代码体积瓶颈、监控第三方库或自身模块的大小变化、为代码重构提供数据支持。
+- **依赖**: 无 Python 依赖，但符号去混淆功能需要系统安装 Xcode Command Line Tools。
+- **文档**: [linkmap_analyzer_pro.md](linkmap_analyzer_pro.md)
+
+### 构建设置检查器 (build_settings_checker.py)
+
+**(新增)** 自动检查 Xcode 项目的构建设置 (Build Settings)，与推荐的包体积优化选项进行对比。
+
+- **主要功能**: 验证项目的 Release 配置是否遵循了常用的体积优化设置。
+- **检查项示例**: `Optimization Level`, `Swift Optimization Level`, `LTO`, `Dead Code Stripping`, `Strip Swift Symbols` 等。
+- **使用场景**: 快速检查和发现项目中可能遗漏的编译优化选项。
+- **依赖**: `pbxproj` (`pip install pbxproj`)
+- **文档**: [build_settings_checker.md](build_settings_checker.md) (待创建)
+
+## 持续优化与 CI/CD 集成
+
+包体积优化不是一次性的任务，而是一个需要持续关注和改进的过程。强烈建议将包体积分析集成到您的持续集成 (CI/CD) 流程中。
 
 ### 1. 建立监控机制
 - **定期分析**：使用工具定期分析包体积
@@ -215,3 +258,24 @@ Link Map分析工具可以帮助您：
     *   **自动化监控**: 将关键包体积指标（如总体积、主二进制大小）的检查集成到 CI/CD (持续集成/持续部署) 流水线中。设置合理的阈值，当体积发生非预期的显著增长时，能够自动触发告警或阻止代码合并，防止体积失控。
     *   **定期回顾与迭代**: 将包体积优化作为一项长期任务，纳入定期的技术评审或迭代计划会议中。根据自动化监控的数据、新的业务发展和技术演进，定期审视优化策略，并启动新一轮的优化流程（可能返回步骤 1 或 2）。
     *   **知识沉淀与共享**: 将优化过程中发现的有效方法、踩过的坑以及解决方案及时记录下来，形成团队内部的知识库或最佳实践文档，方便未来查阅和新成员学习。
+
+### 3. CI/CD 集成示例
+
+**(新增)** 为了方便将包体积分析自动化，我们提供了一个示例 Bash 脚本 (`ci_package_analyzer.sh`) 和一个 GitHub Actions 配置文件 (`.github/workflows/package_size_check.yml`)。
+
+- **`ci_package_analyzer.sh`**: 这个脚本演示了在 CI 环境中执行构建、导出 IPA、查找 Link Map 文件，并调用本仓库提供的分析工具进行检查的基本流程。它还包含了设置体积阈值并在超出时失败的功能。
+  ```bash
+  # 示例：在 CI 环境中运行脚本
+  bash ci_package_analyzer.sh
+  ```
+  **注意**: 您需要根据自己项目的实际构建命令、文件路径和阈值来修改此脚本。
+
+- **`.github/workflows/package_size_check.yml`**: 这个文件展示了如何在 GitHub Actions 中配置一个 Workflow 来自动执行 `ci_package_analyzer.sh` 脚本。它处理了环境设置（macOS, Xcode, Python）、依赖安装，并会在每次对主分支的 Pull Request 或手动触发时运行分析。分析报告可以作为构建产物上传。
+
+通过将这些工具集成到 CI/CD 中，您可以：
+- **自动化检查**: 无需手动运行分析。
+- **早期发现问题**: 在代码合并前及时发现体积异常增长。
+- **强制执行阈值**: 防止包体积无意中超出预期。
+- **追踪历史趋势**: 结合 `ipa_analyzer.py` 的历史记录功能，观察长期变化。
+
+请参考脚本和配置文件的注释，根据您的具体 CI/CD 平台和项目需求进行调整。
